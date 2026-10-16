@@ -1,118 +1,160 @@
-import torch
-import pandas as pd
+import os
+import random
+
 import numpy as np
-
-from torch.utils.data import Dataset, DataLoader
-
-from tokenizers import Tokenizer, processors
-from tokenizers.models import WordLevel
-from tokenizers.trainers import WordLevelTrainer
-from tokenizers.pre_tokenizers import Sequence, Whitespace, Punctuation
-
-from transformers import PreTrainedTokenizerFast, Trainer, TrainingArguments
-
-from datasets import load_dataset, Dataset
-
-from model import *
-
-import evaluate
-
-mnli = load_dataset("nyu-mll/multi_nli")
-
-df_train = mnli['train'].to_pandas()
-df_train = df_train.dropna()
-
-df_val = mnli['validation_matched'].to_pandas()
-df_val = df_val.dropna()
-
-Sentences = df_train["premise"].to_list()
-Sentences.extend(df_train["hypothesis"].to_list())
-
-tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
-tokenizer.pre_tokenizer = Sequence([Whitespace(), Punctuation()])
-tokenizer.post_processor = processors.TemplateProcessing(
-    single="[CLS] $A [SEP]",
-    pair="[CLS] $A [SEP] $B:1 [SEP]:1",
-    special_tokens=[
-        ("[UNK]", 0),
-        ("[CLS]", 1),
-        ("[SEP]", 2),
-        ("[PAD]", 3),
-        ("[MASK]", 4)
-    ],
+import torch
+from datasets import load_dataset
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from transformers import (
+    AutoTokenizer,
+    BertModel,
+    EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
 )
 
-trainer = WordLevelTrainer(
-    special_tokens=["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"],
-    min_frequency=2
-)
-
-tokenizer.train_from_iterator(Sentences, trainer=trainer, length=len(Sentences))
-
-hf_tokenizer = PreTrainedTokenizerFast(
-    tokenizer_object=tokenizer,
-    unk_token="[UNK]",
-    pad_token="[PAD]",
-    cls_token="[CLS]",
-    sep_token="[SEP]",
-    mask_token="[MASK]"
-)
+from model import MAX_LENGTH, NLI, NLIConfig, collate_fn
 
 
-hf_tokenizer.save_pretrained("./MODEL")
+BASE_MODEL = "microsoft/MiniLM-L12-H384-uncased"
+MODEL_DIR = "./MODEL"
+SEED = 42
 
-def collate_fn(batch):
-    input_ids = torch.tensor([x["input_ids"] for x in batch])
-    lengths = torch.tensor([len(x["input_ids"]) for x in batch])
-    labels = torch.tensor([x["labels"] for x in batch])
-    return {"input_ids": input_ids, "lengths":lengths, "labels": labels}
 
-def tokenizes(examples):
-    return hf_tokenizer(examples, truncation=True, max_length=128, padding="max_length")
-    
-def compute_metrics(results):
-	pred, targ = results
-	pred = np.argmax(pred, axis=-1)
-	res = {}
-	metric = evaluate.load("accuracy")
-	res["accuracy"] = metric.compute(predictions=pred, references=targ)["accuracy"]
-	metric = evaluate.load("precision")
-	res["precision"] = metric.compute(predictions=pred, references=targ, average="macro", zero_division=0)["precision"]
-	metric = evaluate.load("recall")
-	res["recall"] = metric.compute(predictions=pred, references=targ, average="macro", zero_division=0)["recall"]
-	metric = evaluate.load("f1")
-	res["f1"] = metric.compute(predictions=pred, references=targ, average="macro")["f1"]
-	return res
-	
-tokenized_train = (df_train["premise"] + " [CLS] " + df_train["hypothesis"]).apply(tokenizes)
-train_set = Dataset.from_dict({"input_ids":[t["input_ids"] for t in tokenized_train], "labels":df_train["label"]})
-tokenized_val = (df_val["premise"] + " [CLS] " + df_val["hypothesis"]).apply(tokenizes)
-val_set = Dataset.from_dict({"input_ids":[t["input_ids"] for t in tokenized_val], "labels":df_val["label"]})
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-model = NLI(NLIConfig(vocab_size=len(hf_tokenizer.get_vocab())))
 
-allparams = sum(p.numel() for p in model.parameters())
-trainparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print("All Param:", allparams, "Train Params:", trainparams)
-args = TrainingArguments(output_dir="./NLIMODEL",
-                         load_best_model_at_end= True,
-                         dataloader_pin_memory=True,
-                         per_device_train_batch_size=32,
-                         learning_rate=0.001,
-                         weight_decay=0.01,
-                         num_train_epochs=30,
-                         eval_strategy="epoch",
-                         save_strategy="epoch"
-                         )
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=-1)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels,
+        predictions,
+        average="macro",
+        zero_division=0,
+    )
+    return {
+        "accuracy": accuracy_score(labels, predictions),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
 
-trainer = Trainer(
-    model=model,
-    args=args,
-    train_dataset=train_set,
-    eval_dataset=val_set,
-    data_collator=collate_fn,
-    compute_metrics=compute_metrics,
-)
 
-trainer.train()
-model.save_pretrained("./MODEL")
+def main():
+    set_seed(SEED)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    dataset = load_dataset("nyu-mll/multi_nli")
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
+
+    # Keep only the three labels required by the assignment.
+    raw_train = dataset["train"].filter(
+        lambda example: example["label"] in (0, 1, 2)
+    )
+    raw_validation = dataset["validation_matched"].filter(
+        lambda example: example["label"] in (0, 1, 2)
+    )
+
+    def preprocess(batch):
+        encoded = tokenizer(
+            batch["premise"],
+            batch["hypothesis"],
+            truncation=True,
+            max_length=MAX_LENGTH,
+            padding="max_length",
+        )
+        encoded["labels"] = batch["label"]
+        return encoded
+
+    train_data = raw_train.map(
+        preprocess,
+        batched=True,
+        remove_columns=raw_train.column_names,
+        desc="Preparing MNLI train",
+    )
+    validation_data = raw_validation.map(
+        preprocess,
+        batched=True,
+        remove_columns=raw_validation.column_names,
+        desc="Preparing MNLI validation",
+    )
+
+    # Initialize the custom NLI class with pretrained MiniLM weights. The
+    # submitted MODEL directory will contain all weights needed by the grader.
+    pretrained_encoder = BertModel.from_pretrained(BASE_MODEL)
+    base_config = pretrained_encoder.config
+    config = NLIConfig(
+        vocab_size=base_config.vocab_size,
+        hidden_size=base_config.hidden_size,
+        nclass=3,
+        num_hidden_layers=base_config.num_hidden_layers,
+        num_attention_heads=base_config.num_attention_heads,
+        intermediate_size=base_config.intermediate_size,
+        max_position_embeddings=base_config.max_position_embeddings,
+        type_vocab_size=base_config.type_vocab_size,
+        hidden_dropout_prob=base_config.hidden_dropout_prob,
+        attention_probs_dropout_prob=base_config.attention_probs_dropout_prob,
+        pad_token_id=tokenizer.pad_token_id,
+        id2label={0: "entailment", 1: "neutral", 2: "contradiction"},
+        label2id={"entailment": 0, "neutral": 1, "contradiction": 2},
+    )
+    model = NLI(config)
+    model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
+    del pretrained_encoder
+
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    print(f"Model parameters: {parameter_count:,}")
+    if parameter_count > 40_000_000:
+        raise ValueError("Model exceeds the 40-million-parameter limit")
+
+    training_args = TrainingArguments(
+        output_dir="./NLIMODEL",
+        num_train_epochs=4,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=64,
+        gradient_accumulation_steps=2,
+        learning_rate=2e-5,
+        weight_decay=0.01,
+        warmup_ratio=0.06,
+        lr_scheduler_type="linear",
+        max_grad_norm=1.0,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+        greater_is_better=True,
+        save_total_limit=2,
+        fp16=torch.cuda.is_available(),
+        dataloader_pin_memory=torch.cuda.is_available(),
+        seed=SEED,
+        data_seed=SEED,
+        logging_steps=200,
+        report_to="none",
+        save_safetensors=True,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_data,
+        eval_dataset=validation_data,
+        data_collator=collate_fn,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=1)],
+    )
+
+    trainer.train()
+    print(trainer.evaluate())
+    trainer.save_model(MODEL_DIR)
+    tokenizer.save_pretrained(MODEL_DIR)
+    print(f"Best model and tokenizer saved to {MODEL_DIR}")
+
+
+if __name__ == "__main__":
+    main()
