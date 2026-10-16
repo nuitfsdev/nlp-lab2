@@ -1,0 +1,11 @@
+{
+  "architectures": [
+    "NLI"
+  ],
+  "dtype": "float32",
+  "hidden_size": 1024,
+  "model_type": "NLI",
+  "nclass": 3,
+  "transformers_version": "4.57.6",
+  "vocab_size": 30000
+}
