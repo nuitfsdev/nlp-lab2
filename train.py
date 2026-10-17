@@ -116,10 +116,10 @@ def main():
     training_args = TrainingArguments(
         output_dir="./NLIMODEL",
         num_train_epochs=3,
-        per_device_train_batch_size=128,
-        per_device_eval_batch_size=512,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=256,
         gradient_accumulation_steps=1,
-        learning_rate=4e-5,
+        learning_rate=2e-5,
         weight_decay=0.01,
         warmup_ratio=0.06,
         lr_scheduler_type="linear",
